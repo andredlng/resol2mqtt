@@ -1,0 +1,23 @@
+{
+  "mqtt_host": "localhost",
+  "mqtt_port": "1883",
+  "mqtt_keepalive": "30",
+  "mqtt_clientid": "resol2mqtt",
+  "mqtt_user": "",
+  "mqtt_password": "",
+  "mqtt_topic": "resol",
+  "mqtt_tls": "false",
+  "mqtt_tls_version": "TLSv1.2",
+  "mqtt_verify_mode": "CERT_REQUIRED",
+  "mqtt_ssl_ca_path": "",
+  "mqtt_tls_no_verify": "false",
+  "resol_host": "192.168.1.100",
+  "resol_port": "80",
+  "resol_username": "admin",
+  "resol_password": "admin",
+  "resol_api_key": "",
+  "resol_device_type": "auto",
+  "scan_interval": "300",
+  "timestamp": "false",
+  "verbose": "false"
+}

@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""
+resol2mqtt - Bridge between Resol solar thermal controllers and MQTT
+
+Reads sensor data from Resol devices (KM1, KM2, DL2, DL2Plus, DL3, VBus)
+and publishes to MQTT with hierarchical topics.
+"""
+
+import argparse
+import datetime
+import json
+import logging
+import re
+import signal
+import ssl
+import sys
+import time
+import traceback
+
+import paho.mqtt.client as mqtt
+import requests
+
+# Global state
+mqtt_client = None
+daemon_args = None
+sensor_states = {}
+shutdown_flag = False
+detected_device_type = None
+
+
+def eprint(*args, **kwargs):
+    """Print to stderr"""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def parse_args():
+    """Parse command-line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Bridge between Resol devices and MQTT'
+    )
+
+    parser.add_argument(
+        '-c', '--config',
+        default='/etc/resol2mqtt.conf',
+        help='Configuration file (default: /etc/resol2mqtt.conf)'
+    )
+    parser.add_argument(
+        '--mqtt-host',
+        default='localhost',
+        help='MQTT broker host (default: localhost)'
+    )
+    parser.add_argument(
+        '--mqtt-port',
+        type=int,
+        default=1883,
+        help='MQTT broker port (default: 1883)'
+    )
+    parser.add_argument(
+        '--mqtt-keepalive',
+        type=int,
+        default=30,
+        help='MQTT keepalive interval (default: 30)'
+    )
+    parser.add_argument(
+        '--mqtt-clientid',
+        default='resol2mqtt',
+        help='MQTT client ID (default: resol2mqtt)'
+    )
+    parser.add_argument(
+        '--mqtt-user',
+        default='',
+        help='MQTT username'
+    )
+    parser.add_argument(
+        '--mqtt-password',
+        default='',
+        help='MQTT password'
+    )
+    parser.add_argument(
+        '--mqtt-topic',
+        default='resol',
+        help='MQTT base topic (default: resol)'
+    )
+    parser.add_argument(
+        '--mqtt-tls',
+        default=False,
+        action='store_true',
+        help='Enable MQTT TLS (default: false)'
+    )
+    parser.add_argument(
+        '--mqtt-tls-version',
+        default='TLSv1.2',
+        help='MQTT TLS version (default: TLSv1.2)'
+    )
+    parser.add_argument(
+        '--mqtt-verify-mode',
+        default='CERT_REQUIRED',
+        help='MQTT certificate verification (default: CERT_REQUIRED)'
+    )
+    parser.add_argument(
+        '--mqtt-ssl-ca-path',
+        default='',
+        help='MQTT CA certificate path'
+    )
+    parser.add_argument(
+        '--mqtt-tls-no-verify',
+        default=False,
+        action='store_true',
+        help='Disable hostname verification (default: false)'
+    )
+    parser.add_argument(
+        '--resol-host',
+        required=False,
+        help='Resol device hostname or IP'
+    )
+    parser.add_argument(
+        '--resol-port',
+        type=int,
+        default=80,
+        help='Resol device port (default: 80)'
+    )
+    parser.add_argument(
+        '--resol-username',
+        default='admin',
+        help='Resol device username (default: admin)'
+    )
+    parser.add_argument(
+        '--resol-password',
+        default='admin',
+        help='Resol device password (default: admin)'
+    )
+    parser.add_argument(
+        '--resol-api-key',
+        default='',
+        help='Resol API key (DL2/DL3 filter)'
+    )
+    parser.add_argument(
+        '--resol-device-type',
+        default='auto',
+        help='Resol device type: auto, km2, dl2plus, dl2, dl3, vbus (default: auto)'
+    )
+    parser.add_argument(
+        '--scan-interval',
+        type=int,
+        default=300,
+        help='Scan interval in seconds (default: 300)'
+    )
+    parser.add_argument(
+        '--timestamp',
+        default=False,
+        action='store_true',
+        help='Publish timestamp with sensor data (default: false)'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    return parser.parse_args()
+
+
+def parse_config(args):
+    """Load configuration from JSON file and override defaults"""
+    try:
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+
+        # Override arguments with config file values
+        for key, value in config.items():
+            # Convert string booleans to actual booleans for config file values
+            if key in ('mqtt_tls', 'mqtt_tls_no_verify', 'timestamp', 'verbose'):
+                if isinstance(value, str):
+                    value = value.lower() == 'true'
+
+            # Convert string numbers to integers
+            if key in ('mqtt_port', 'mqtt_keepalive', 'resol_port', 'scan_interval'):
+                value = int(value)
+
+            # Set attribute
+            setattr(args, key, value)
+
+        logging.debug(f"Loaded configuration from {args.config}")
+    except FileNotFoundError:
+        logging.info(f"Configuration file {args.config} not found, using defaults")
+    except json.JSONDecodeError as e:
+        eprint(f"Error parsing configuration file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        eprint(f"Error loading configuration: {e}")
+        eprint(traceback.format_exc())
+        sys.exit(1)
+
+    return args
+
+
+def validate_config(args):
+    """Validate required configuration"""
+    if not args.resol_host:
+        eprint("Error: resol_host is required (via --resol-host or config file)")
+        sys.exit(1)
+
+
+def init_mqtt():
+    """Initialize MQTT client"""
+    global mqtt_client, daemon_args
+
+    logging.debug("Initializing MQTT client")
+
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id=daemon_args.mqtt_clientid
+    )
+
+    # Set callbacks
+    client.on_connect = on_mqtt_connect
+    client.on_disconnect = on_mqtt_disconnect
+
+    # Set username and password if provided
+    if daemon_args.mqtt_user and daemon_args.mqtt_password:
+        client.username_pw_set(daemon_args.mqtt_user, daemon_args.mqtt_password)
+
+    # Configure TLS if enabled
+    if daemon_args.mqtt_tls:
+        logging.debug("Configuring MQTT TLS")
+
+        # Map TLS version string to ssl constant
+        tls_version_map = {
+            'TLSv1': ssl.PROTOCOL_TLSv1,
+            'TLSv1.1': ssl.PROTOCOL_TLSv1_1,
+            'TLSv1.2': ssl.PROTOCOL_TLSv1_2,
+        }
+        tls_version = tls_version_map.get(daemon_args.mqtt_tls_version, ssl.PROTOCOL_TLSv1_2)
+
+        # Map verify mode string to ssl constant
+        verify_mode_map = {
+            'CERT_NONE': ssl.CERT_NONE,
+            'CERT_OPTIONAL': ssl.CERT_OPTIONAL,
+            'CERT_REQUIRED': ssl.CERT_REQUIRED,
+        }
+        verify_mode = verify_mode_map.get(daemon_args.mqtt_verify_mode, ssl.CERT_REQUIRED)
+
+        # Configure TLS
+        ca_certs = daemon_args.mqtt_ssl_ca_path if daemon_args.mqtt_ssl_ca_path else None
+        client.tls_set(
+            ca_certs=ca_certs,
+            cert_reqs=verify_mode,
+            tls_version=tls_version
+        )
+
+        # Disable hostname verification if requested
+        if daemon_args.mqtt_tls_no_verify:
+            client.tls_insecure_set(True)
+
+    mqtt_client = client
+    return client
+
+
+def on_mqtt_connect(client, _userdata, _flags, reason_code, _properties):
+    """MQTT connection callback"""
+    if reason_code == 0:
+        logging.info("Connected to MQTT broker")
+    else:
+        logging.error(f"Failed to connect to MQTT broker: {reason_code}")
+
+
+def on_mqtt_disconnect(_client, _userdata, reason_code, _properties):
+    """MQTT disconnection callback"""
+    if reason_code != 0:
+        logging.warning(f"Disconnected from MQTT broker: {reason_code}")
+
+
+def publish_to_mqtt(device_id, sensor_name, value, unit=None):
+    """Publish sensor data to MQTT"""
+    global mqtt_client, daemon_args, sensor_states
+
+    # Create unique sensor key
+    sensor_key = f"{device_id}/{sensor_name}"
+
+    # Check if value changed (avoid duplicate publishes)
+    if sensor_key in sensor_states and sensor_states[sensor_key] == str(value):
+        logging.debug(f"Sensor {sensor_key} value unchanged: {value}")
+        return
+
+    # Update state
+    sensor_states[sensor_key] = str(value)
+
+    # Build topic
+    topic = f"{daemon_args.mqtt_topic}/{device_id}/{sensor_name}"
+
+    # Publish value
+    logging.info(f"Publishing: {topic} = {value}")
+    mqtt_client.publish(topic, str(value), retain=True)
+
+    # Optionally publish unit as separate topic
+    if unit and unit.strip():
+        mqtt_client.publish(f"{topic}/unit", unit, retain=True)
+
+    # Optionally publish timestamp
+    if daemon_args.timestamp:
+        mqtt_client.publish(f"{topic}/timestamp", time.time(), retain=True)
+
+
+def detect_resol_device():
+    """Auto-detect Resol device type"""
+    global daemon_args, detected_device_type
+
+    logging.info("Detecting Resol device type")
+
+    url = f"http://{daemon_args.resol_host}:{daemon_args.resol_port}/cgi-bin/get_resol_device_information"
+
+    try:
+        response = requests.get(url, timeout=10)
+
+        if response.status_code == 200:
+            text = response.text
+            logging.debug(f"Device information response: {text[:200]}")
+
+            # Parse product information
+            product_match = re.search(r'product\s*=\s*["\']([^"\']+)["\']', text)
+            if product_match:
+                product = product_match.group(1).lower()
+                logging.info(f"Detected product: {product}")
+
+                # Determine device type
+                if 'km2' in product:
+                    detected_device_type = 'km2'
+                elif 'dl2plus' in product or 'dl2 plus' in product:
+                    detected_device_type = 'dl2plus'
+                elif 'dl3' in product:
+                    detected_device_type = 'dl3'
+                elif 'dl2' in product:
+                    detected_device_type = 'dl2'
+                else:
+                    logging.warning(f"Unknown product type: {product}, defaulting to vbus")
+                    detected_device_type = 'vbus'
+
+                logging.info(f"Device type: {detected_device_type}")
+                return detected_device_type
+
+        # If detection fails, fallback to vbus
+        logging.warning("Device detection endpoint not available, assuming vbus device")
+        detected_device_type = 'vbus'
+        return detected_device_type
+
+    except requests.RequestException as e:
+        logging.error(f"Failed to detect device type: {e}")
+        # Use configured device type or default to vbus
+        if daemon_args.resol_device_type and daemon_args.resol_device_type != 'auto':
+            detected_device_type = daemon_args.resol_device_type
+        else:
+            detected_device_type = 'vbus'
+        logging.info(f"Using device type: {detected_device_type}")
+        return detected_device_type
+
+
+def fetch_data_km2_dl2plus():
+    """Fetch data from KM2/DL2Plus using JSON-RPC 2.0"""
+    global daemon_args
+
+    url = f"http://{daemon_args.resol_host}:{daemon_args.resol_port}/cgi-bin/resol-webservice"
+    headers = {"Content-Type": "application/json"}
+
+    # Step 1: Login and get authId
+    login_payload = json.dumps([{
+        "id": "1",
+        "jsonrpc": "2.0",
+        "method": "login",
+        "params": {
+            "username": daemon_args.resol_username,
+            "password": daemon_args.resol_password
+        }
+    }])
+
+    logging.debug("Logging in to KM2/DL2Plus device")
+    response = requests.post(url, headers=headers, data=login_payload, timeout=30)
+    response.raise_for_status()
+
+    auth_response = response.json()
+    if isinstance(auth_response, list) and len(auth_response) > 0:
+        auth_result = auth_response[0].get("result", {})
+        auth_id = auth_result.get("authId")
+
+        if not auth_id:
+            raise Exception("Failed to get authId from login response")
+
+        logging.debug(f"Logged in with authId: {auth_id}")
+    else:
+        raise Exception("Unexpected login response format")
+
+    # Step 2: Fetch current data using authId
+    data_payload = json.dumps([{
+        "id": "1",
+        "jsonrpc": "2.0",
+        "method": "dataGetCurrentData",
+        "params": {
+            "authId": auth_id
+        }
+    }])
+
+    logging.debug("Fetching current data from KM2/DL2Plus device")
+    response = requests.post(url, headers=headers, data=data_payload, timeout=30)
+    response.raise_for_status()
+
+    data_response = response.json()
+    if isinstance(data_response, list) and len(data_response) > 0:
+        return data_response[0].get("result", {})
+    else:
+        raise Exception("Unexpected data response format")
+
+
+def fetch_data_dlx():
+    """Fetch data from DL2/DL3 using HTTP GET"""
+    global daemon_args
+
+    url = f"http://{daemon_args.resol_host}:{daemon_args.resol_port}/dlx/download/live"
+
+    # Add authentication and optional filter
+    params = {}
+    if daemon_args.resol_username and daemon_args.resol_password:
+        params["sessionAuthUsername"] = daemon_args.resol_username
+        params["sessionAuthPassword"] = daemon_args.resol_password
+
+    if daemon_args.resol_api_key:
+        params["filter"] = daemon_args.resol_api_key
+
+    logging.debug("Fetching data from DL2/DL3 device")
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    return response.json()
+
+
+def fetch_data_vbus():
+    """Fetch data from VBus/KM1 via json-live-data-server"""
+    global daemon_args
+
+    url = f"http://{daemon_args.resol_host}:{daemon_args.resol_port}/api/v1/live-data"
+
+    logging.debug("Fetching data from VBus/KM1 json-live-data-server")
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    return response.json()
+
+
+def fetch_resol_data():
+    """Fetch data from Resol device based on detected type"""
+    global detected_device_type
+
+    if detected_device_type in ('km2', 'dl2plus'):
+        return fetch_data_km2_dl2plus()
+    elif detected_device_type in ('dl2', 'dl3'):
+        return fetch_data_dlx()
+    elif detected_device_type == 'vbus':
+        return fetch_data_vbus()
+    else:
+        raise Exception(f"Unsupported device type: {detected_device_type}")
+
+
+def create_device_id(bus_dest, bus_src):
+    """Generate device ID from bus addresses"""
+    # Clean and format device names
+    dest = str(bus_dest).replace(' ', '_').replace(':', '_').lower()
+    src = str(bus_src).replace(' ', '_').replace(':', '_').lower()
+
+    # Create composite ID
+    if dest and src and dest != 'unknown' and src != 'unknown':
+        return f"{dest}_{src}"
+    elif src and src != 'unknown':
+        return src
+    elif dest and dest != 'unknown':
+        return dest
+    else:
+        return "unknown_device"
+
+
+def format_sensor_value(value, unit):
+    """Format sensor values"""
+    # Round float values
+    if isinstance(value, float):
+        return round(value, 2)
+
+    # Handle date fields - convert from Resol epoch (2001-01-01)
+    if unit and 'date' in str(unit).lower():
+        try:
+            epoch_start = datetime.datetime(2001, 1, 1, 0, 0, 0)
+            dt = epoch_start + datetime.timedelta(seconds=float(value))
+            return dt.isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    return value
+
+
+def parse_resol_response(response):
+    """Parse Resol device response into normalized sensor data structure"""
+    sensors = {}
+
+    # Handle different response formats
+    headers = response.get("headers", [])
+    headersets = response.get("headersets", [])
+
+    if not headers or not headersets:
+        logging.warning("No headers or headersets in response")
+        return sensors
+
+    # Get first headerset (current data)
+    if len(headersets) == 0:
+        logging.warning("No headersets available")
+        return sensors
+
+    headerset = headersets[0]
+    packets = headerset.get("packets", [])
+
+    # Iterate through headers (bus devices)
+    for header_idx, header in enumerate(headers):
+        # Get packet data for this header
+        if header_idx >= len(packets):
+            logging.warning(f"No packet data for header index {header_idx}")
+            continue
+
+        packet = packets[header_idx]
+        field_values = packet.get("field_values", [])
+
+        # Create device ID
+        bus_dest = header.get("destination_name", "unknown")
+        bus_src = header.get("source_name", "unknown")
+        device_id = create_device_id(bus_dest, bus_src)
+
+        # Iterate through fields (sensors)
+        fields = header.get("fields", [])
+        for field_idx, field in enumerate(fields):
+            # Get sensor value
+            if field_idx >= len(field_values):
+                logging.warning(f"No field value for field index {field_idx}")
+                continue
+
+            field_value = field_values[field_idx]
+            raw_value = field_value.get("raw_value")
+
+            if raw_value is None:
+                continue
+
+            # Get sensor metadata
+            sensor_name = field.get("name", "unknown").replace(" ", "_").lower()
+            sensor_unit = field.get("unit_text", "").strip()
+
+            # Format value
+            formatted_value = format_sensor_value(raw_value, sensor_unit)
+
+            # Create unique sensor key
+            header_id = header.get("id", f"header_{header_idx}")
+            field_id = field.get("id", f"field_{field_idx}")
+            unique_id = f"{header_id}_{field_id}"
+
+            sensors[unique_id] = {
+                "device_id": device_id,
+                "name": sensor_name,
+                "value": formatted_value,
+                "unit": sensor_unit,
+                "description": field.get("name", "")
+            }
+
+    return sensors
+
+
+def polling_loop():
+    """Main polling loop"""
+    global shutdown_flag, daemon_args
+
+    retry_count = 0
+    max_retries = 5
+    retry_delay = 10
+
+    while not shutdown_flag:
+        try:
+            # Fetch data from Resol device
+            logging.debug("Fetching data from Resol device")
+            raw_data = fetch_resol_data()
+
+            # Parse data
+            sensors = parse_resol_response(raw_data)
+            logging.debug(f"Parsed {len(sensors)} sensors")
+
+            # Publish to MQTT
+            for _, sensor_data in sensors.items():
+                publish_to_mqtt(
+                    sensor_data["device_id"],
+                    sensor_data["name"],
+                    sensor_data["value"],
+                    sensor_data["unit"]
+                )
+
+            # Reset retry count on success
+            retry_count = 0
+
+            # Wait for next scan interval
+            logging.debug(f"Waiting {daemon_args.scan_interval} seconds until next scan")
+            time.sleep(daemon_args.scan_interval)
+
+        except requests.RequestException as e:
+            retry_count += 1
+            logging.error(f"Connection error (attempt {retry_count}/{max_retries}): {e}")
+
+            if retry_count >= max_retries:
+                logging.error("Max retries reached. Waiting for longer period...")
+                time.sleep(retry_delay * 6)
+                retry_count = 0
+            else:
+                time.sleep(retry_delay)
+
+        except Exception as e:
+            logging.error(f"Unexpected error in polling loop: {e}")
+            logging.error(traceback.format_exc())
+            time.sleep(retry_delay)
+
+
+def shutdown(_signum, _frame):
+    """Signal handler for graceful shutdown"""
+    global shutdown_flag, mqtt_client
+
+    logging.info("Shutdown signal received")
+    shutdown_flag = True
+
+    if mqtt_client:
+        logging.info("Disconnecting from MQTT broker")
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+
+    sys.exit(0)
+
+
+def main():
+    """Main entry point"""
+    global daemon_args, mqtt_client
+
+    # Register signal handlers
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # Parse configuration
+    daemon_args = parse_args()
+    daemon_args = parse_config(daemon_args)
+    validate_config(daemon_args)
+
+    # Setup logging
+    if daemon_args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    logging.info("Starting resol2mqtt")
+
+    # Detect Resol device type if auto
+    if daemon_args.resol_device_type == 'auto':
+        detect_resol_device()
+    else:
+        global detected_device_type
+        detected_device_type = daemon_args.resol_device_type
+        logging.info(f"Using configured device type: {detected_device_type}")
+
+    # Initialize MQTT client
+    mqtt_client = init_mqtt()
+
+    # Connect to MQTT broker
+    logging.info(f"Connecting to MQTT broker at {daemon_args.mqtt_host}:{daemon_args.mqtt_port}")
+    mqtt_client.connect(
+        daemon_args.mqtt_host,
+        daemon_args.mqtt_port,
+        daemon_args.mqtt_keepalive
+    )
+
+    # Start MQTT loop in background thread
+    mqtt_client.loop_start()
+
+    # Give MQTT time to connect
+    time.sleep(2)
+
+    # Enter polling loop
+    logging.info("Entering polling loop")
+    polling_loop()
+
+
+if __name__ == "__main__":
+    main()

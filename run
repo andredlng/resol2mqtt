@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run script for resol2mqtt
+
+. venv/bin/activate
+exec /usr/bin/env python resol2mqtt
