@@ -12,6 +12,8 @@ A standalone Python bridge that reads sensor data from Resol solar thermal syste
 - **TLS/SSL Support**: Secure MQTT connections with certificate verification
 - **Configurable**: JSON configuration file with comprehensive options
 - **Robust Error Handling**: Connection retry logic with graceful degradation
+- **MQTT Connection Resilience**: Automatic reconnection with circuit breaker pattern
+- **Fail-Fast Startup**: Exits cleanly if MQTT broker is unavailable for systemd restart
 - **Minimal Dependencies**: Only paho-mqtt and requests
 
 ## Supported Resol Devices
@@ -112,6 +114,10 @@ Configuration is done via a JSON file, typically located at `/etc/resol2mqtt.con
 | `mqtt_verify_mode` | `CERT_REQUIRED` | Certificate verification (CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED) |
 | `mqtt_ssl_ca_path` | `` | Path to CA certificate file |
 | `mqtt_tls_no_verify` | `false` | Disable hostname verification |
+| `mqtt_connect_timeout` | `30` | Connection timeout in seconds |
+| `mqtt_connect_retries` | `5` | Max connection retry attempts at startup |
+| `mqtt_connect_retry_delay` | `5` | Delay between connection retries in seconds |
+| `mqtt_reconnect_check_interval` | `30` | Interval to check for reconnection when circuit breaker active |
 
 ### Resol Device Configuration
 
@@ -182,6 +188,34 @@ The `device_id` is automatically generated from the VBus source and destination 
 - Source: "VBus Controller DFA"
 - Destination: "Solar Module"
 - Device ID: `solar_module_vbus_controller_dfa`
+
+## MQTT Connection Resilience
+
+resol2mqtt implements robust connection handling to ensure reliable operation:
+
+### Startup Behavior
+
+- **Connection Retry**: At startup, resol2mqtt attempts to connect to the MQTT broker with configurable retry logic
+- **Fail-Fast**: If the MQTT broker is unavailable after all retries, the application exits cleanly
+- **Systemd Integration**: When deployed with systemd, the service automatically restarts after a delay, eliminating the need for manual intervention
+
+### Runtime Behavior
+
+- **Automatic Reconnection**: If the MQTT connection is lost during operation, the Paho MQTT library automatically attempts to reconnect in the background
+- **Circuit Breaker**: When disconnected, polling of the Resol device is paused to conserve resources and avoid collecting data that cannot be published
+- **Automatic Recovery**: Once the MQTT connection is restored, the circuit breaker deactivates and normal polling resumes immediately
+- **Data Loss Handling**: Data collected during disconnection is not queued or buffered - the application accepts temporary data loss for simplicity and memory efficiency
+
+### Connection State Logging
+
+The application provides clear logging of connection state changes:
+- Initial connection attempts and success/failure
+- Unexpected disconnections with reason codes
+- Circuit breaker activation (polling paused)
+- Reconnection success (polling resumed)
+- Failed publish attempts when disconnected
+
+This approach ensures the application is self-healing and requires minimal manual intervention, making it suitable for production IoT deployments.
 
 ## Usage
 
