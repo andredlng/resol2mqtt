@@ -166,6 +166,18 @@ def parse_args():
         help='Resol device type: auto, km2, dl2plus, dl2, dl3, vbus (default: auto)'
     )
     parser.add_argument(
+        '--resol-detect-retries',
+        type=int,
+        default=10,
+        help='Max device detection retry attempts (default: 10)'
+    )
+    parser.add_argument(
+        '--resol-detect-retry-delay',
+        type=int,
+        default=10,
+        help='Delay between device detection retries in seconds (default: 10)'
+    )
+    parser.add_argument(
         '--scan-interval',
         type=int,
         default=300,
@@ -202,7 +214,8 @@ def parse_config(args):
             # Convert string numbers to integers
             if key in ('mqtt_port', 'mqtt_keepalive', 'mqtt_connect_timeout', 'mqtt_connect_retries',
                        'mqtt_connect_retry_delay', 'mqtt_reconnect_check_interval',
-                       'resol_port', 'scan_interval'):
+                       'resol_port', 'resol_detect_retries', 'resol_detect_retry_delay',
+                       'scan_interval'):
                 value = int(value)
 
             # Set attribute
@@ -346,7 +359,11 @@ def publish_to_mqtt(device_id, sensor_name, value, unit=None):
 
 
 def detect_resol_device():
-    """Auto-detect Resol device type"""
+    """Auto-detect Resol device type.
+
+    Returns True if the device was reachable (detection succeeded),
+    False if the device was unreachable (network error, timeout).
+    """
     global daemon_args, detected_device_type
 
     logging.info("Detecting Resol device type")
@@ -380,22 +397,16 @@ def detect_resol_device():
                     detected_device_type = 'vbus'
 
                 logging.info(f"Device type: {detected_device_type}")
-                return detected_device_type
+                return True
 
-        # If detection fails, fallback to vbus
+        # Device reachable but detection endpoint not available
         logging.warning("Device detection endpoint not available, assuming vbus device")
         detected_device_type = 'vbus'
-        return detected_device_type
+        return True
 
     except requests.RequestException as e:
         logging.error(f"Failed to detect device type: {e}")
-        # Use configured device type or default to vbus
-        if daemon_args.resol_device_type and daemon_args.resol_device_type != 'auto':
-            detected_device_type = daemon_args.resol_device_type
-        else:
-            detected_device_type = 'vbus'
-        logging.info(f"Using device type: {detected_device_type}")
-        return detected_device_type
+        return False
 
 
 def fetch_data_km2_dl2plus():
@@ -694,7 +705,7 @@ def shutdown(_signum, _frame):
 
 def main():
     """Main entry point"""
-    global daemon_args, mqtt_client
+    global daemon_args, mqtt_client, detected_device_type
 
     # Register signal handlers
     signal.signal(signal.SIGINT, shutdown)
@@ -721,9 +732,17 @@ def main():
 
     # Detect Resol device type if auto
     if daemon_args.resol_device_type == 'auto':
-        detect_resol_device()
+        for attempt in range(1, daemon_args.resol_detect_retries + 1):
+            logging.info(f"Device detection attempt {attempt}/{daemon_args.resol_detect_retries}")
+            if detect_resol_device():
+                break
+            if attempt < daemon_args.resol_detect_retries:
+                logging.info(f"Retrying device detection in {daemon_args.resol_detect_retry_delay} seconds...")
+                time.sleep(daemon_args.resol_detect_retry_delay)
+            else:
+                logging.error("Failed to detect Resol device after all retries, defaulting to vbus")
+                detected_device_type = 'vbus'
     else:
-        global detected_device_type
         detected_device_type = daemon_args.resol_device_type
         logging.info(f"Using configured device type: {detected_device_type}")
 

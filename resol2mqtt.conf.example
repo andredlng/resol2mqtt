@@ -21,6 +21,8 @@
   "resol_password": "admin",
   "resol_api_key": "",
   "resol_device_type": "auto",
+  "resol_detect_retries": "10",
+  "resol_detect_retry_delay": "10",
   "scan_interval": "300",
   "timestamp": "false",
   "verbose": "false"

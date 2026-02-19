@@ -129,6 +129,8 @@ Configuration is done via a JSON file, typically located at `/etc/resol2mqtt.con
 | `resol_password` | `admin` | Device password |
 | `resol_api_key` | `` | DL2/DL3 filter/API key (optional) |
 | `resol_device_type` | `auto` | Device type: auto, km2, dl2plus, dl2, dl3, vbus |
+| `resol_detect_retries` | `10` | Max device detection retry attempts at startup |
+| `resol_detect_retry_delay` | `10` | Delay between device detection retries in seconds |
 
 ### Application Configuration
 
@@ -188,6 +190,14 @@ The `device_id` is automatically generated from the VBus source and destination 
 - Source: "VBus Controller DFA"
 - Destination: "Solar Module"
 - Device ID: `solar_module_vbus_controller_dfa`
+
+## Device Detection Resilience
+
+When `resol_device_type` is set to `auto`, resol2mqtt attempts to detect the Resol device type at startup. If the device is not yet network-reachable (e.g., after a server reboot), detection is retried with configurable attempts and delay. This prevents the application from falling back to the wrong device type when the Resol device simply hasn't finished booting yet.
+
+- **Retry Logic**: Configurable number of retries (`resol_detect_retries`) with delay (`resol_detect_retry_delay`) between attempts
+- **Smart Fallback**: Only retries on network errors (unreachable, timeout, connection refused). If the device is reachable but has an unknown product type, it defaults to `vbus` immediately without retrying
+- **Final Fallback**: After exhausting all retries, defaults to `vbus` device type
 
 ## MQTT Connection Resilience
 
