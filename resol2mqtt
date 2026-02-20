@@ -622,7 +622,7 @@ def parse_resol_response(response):
 
 def polling_loop():
     """Main polling loop"""
-    global shutdown_flag, daemon_args, mqtt_connected
+    global shutdown_flag, daemon_args, mqtt_connected, detected_device_type
 
     retry_count = 0
     max_retries = 5
@@ -674,6 +674,17 @@ def polling_loop():
         except requests.RequestException as e:
             retry_count += 1
             logging.error(f"Connection error (attempt {retry_count}/{max_retries}): {e}")
+
+            # If we get a 404 and device type was auto-detected, re-run detection
+            if (isinstance(e, requests.HTTPError) and e.response is not None
+                    and e.response.status_code == 404
+                    and daemon_args.resol_device_type == 'auto'):
+                logging.warning(f"HTTP 404 with auto-detected device type '{detected_device_type}'"
+                                " - re-running device detection")
+                if detect_resol_device():
+                    logging.info(f"Device re-detected as: {detected_device_type}")
+                    retry_count = 0
+                    continue
 
             if retry_count >= max_retries:
                 logging.error("Max retries reached. Waiting for longer period...")
