@@ -1,9 +1,5 @@
-venv
-.git
-*.pyc
-__pycache__
-*.conf
-!*.conf.example
-.gitignore
-README.md
-LICENSE.md
+*
+!src/
+!pyproject.toml
+!README.md
+!LICENSE.md
