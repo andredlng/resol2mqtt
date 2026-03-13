@@ -40,12 +40,12 @@ def detect_resol_device():
 
         if response.status_code == 200:
             text = response.text
-            logging.debug(f"Device information response: {text[:200]}")
+            logging.info("Device information response: {}".format(text[:200]))
 
             product_match = re.search(r'product\s*=\s*["\']([^"\']+)["\']', text)
             if product_match:
                 product = product_match.group(1).lower()
-                logging.info(f"Detected product: {product}")
+                logging.info("Detected product: {}".format(product))
 
                 if 'km2' in product:
                     detected_device_type = 'km2'
@@ -56,18 +56,18 @@ def detect_resol_device():
                 elif 'dl2' in product:
                     detected_device_type = 'dl2'
                 else:
-                    logging.warning(f"Unknown product type: {product}, defaulting to vbus")
+                    logging.info("Unknown product type: {}, defaulting to vbus".format(product))
                     detected_device_type = 'vbus'
 
-                logging.info(f"Device type: {detected_device_type}")
+                logging.info("Device type: {}".format(detected_device_type))
                 return True
 
-        logging.warning("Device detection endpoint not available, assuming vbus device")
+        logging.info("Device detection endpoint not available, assuming vbus device")
         detected_device_type = 'vbus'
         return True
 
     except requests.RequestException as e:
-        logging.error(f"Failed to detect device type: {e}")
+        logging.error(traceback.format_exc())
         return False
 
 
@@ -88,7 +88,7 @@ def fetch_data_km2_dl2plus():
         }
     }])
 
-    logging.debug("Logging in to KM2/DL2Plus device")
+    logging.info("Logging in to KM2/DL2Plus device")
     response = requests.post(url, headers=headers, data=login_payload, timeout=30)
     response.raise_for_status()
 
@@ -100,7 +100,7 @@ def fetch_data_km2_dl2plus():
         if not auth_id:
             raise Exception("Failed to get authId from login response")
 
-        logging.debug(f"Logged in with authId: {auth_id}")
+        logging.info("Logged in with authId: {}".format(auth_id))
     else:
         raise Exception("Unexpected login response format")
 
@@ -113,7 +113,7 @@ def fetch_data_km2_dl2plus():
         }
     }])
 
-    logging.debug("Fetching current data from KM2/DL2Plus device")
+    logging.info("Fetching current data from KM2/DL2Plus device")
     response = requests.post(url, headers=headers, data=data_payload, timeout=30)
     response.raise_for_status()
 
@@ -138,7 +138,7 @@ def fetch_data_dlx():
     if config.resol_api_key:
         params["filter"] = config.resol_api_key
 
-    logging.debug("Fetching data from DL2/DL3 device")
+    logging.info("Fetching data from DL2/DL3 device")
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
 
@@ -151,7 +151,7 @@ def fetch_data_vbus():
 
     url = f"http://{config.resol_host}:{config.resol_port}/api/v1/live-data"
 
-    logging.debug("Fetching data from VBus/KM1 json-live-data-server")
+    logging.info("Fetching data from VBus/KM1 json-live-data-server")
     response = requests.get(url, timeout=30)
     response.raise_for_status()
 
@@ -211,11 +211,11 @@ def parse_resol_response(response):
     headersets = response.get("headersets", [])
 
     if not headers or not headersets:
-        logging.warning("No headers or headersets in response")
+        logging.info("No headers or headersets in response")
         return sensors
 
     if len(headersets) == 0:
-        logging.warning("No headersets available")
+        logging.info("No headersets available")
         return sensors
 
     headerset = headersets[0]
@@ -223,7 +223,7 @@ def parse_resol_response(response):
 
     for header_idx, header in enumerate(headers):
         if header_idx >= len(packets):
-            logging.warning(f"No packet data for header index {header_idx}")
+            logging.info("No packet data for header index {}".format(header_idx))
             continue
 
         packet = packets[header_idx]
@@ -236,7 +236,7 @@ def parse_resol_response(response):
         fields = header.get("fields", [])
         for field_idx, field in enumerate(fields):
             if field_idx >= len(field_values):
-                logging.warning(f"No field value for field index {field_idx}")
+                logging.info("No field value for field index {}".format(field_idx))
                 continue
 
             field_value = field_values[field_idx]
@@ -272,7 +272,7 @@ def publish_to_mqtt(device_id, sensor_name, value, unit=None):
     sensor_key = f"{device_id}/{sensor_name}"
 
     if sensor_key in sensor_states and sensor_states[sensor_key] == str(value):
-        logging.debug(f"Sensor {sensor_key} value unchanged: {value}")
+        logging.info("Sensor {} value unchanged: {}".format(sensor_key, value))
         return
 
     sensor_states[sensor_key] = str(value)
@@ -294,18 +294,18 @@ def polling_loop(stop):
         resol_detect_retries = int(config.resol_detect_retries or 10)
         resol_detect_retry_delay = int(config.resol_detect_retry_delay or 10)
         for attempt in range(1, resol_detect_retries + 1):
-            logging.info(f"Device detection attempt {attempt}/{resol_detect_retries}")
+            logging.info("Device detection attempt {}/{}".format(attempt, resol_detect_retries))
             if detect_resol_device():
                 break
             if attempt < resol_detect_retries:
-                logging.info(f"Retrying device detection in {resol_detect_retry_delay} seconds...")
+                logging.info("Retrying device detection in {} seconds...".format(resol_detect_retry_delay))
                 time.sleep(resol_detect_retry_delay)
             else:
                 logging.error("Failed to detect Resol device after all retries, defaulting to vbus")
                 detected_device_type = 'vbus'
     else:
         detected_device_type = config.resol_device_type
-        logging.info(f"Using configured device type: {detected_device_type}")
+        logging.info("Using configured device type: {}".format(detected_device_type))
 
     retry_count = 0
     max_retries = 5
@@ -314,11 +314,11 @@ def polling_loop(stop):
 
     while not stop():
         try:
-            logging.debug("Fetching data from Resol device")
+            logging.info("Fetching data from Resol device")
             raw_data = fetch_resol_data()
 
             sensors = parse_resol_response(raw_data)
-            logging.debug(f"Parsed {len(sensors)} sensors")
+            logging.info("Parsed {} sensors".format(len(sensors)))
 
             for _, sensor_data in sensors.items():
                 publish_to_mqtt(
@@ -330,20 +330,20 @@ def polling_loop(stop):
 
             retry_count = 0
 
-            logging.debug(f"Waiting {scan_interval} seconds until next scan")
+            logging.info("Waiting {} seconds until next scan".format(scan_interval))
             time.sleep(scan_interval)
 
         except requests.RequestException as e:
             retry_count += 1
-            logging.error(f"Connection error (attempt {retry_count}/{max_retries}): {e}")
+            logging.error(traceback.format_exc())
 
             if (isinstance(e, requests.HTTPError) and e.response is not None
                     and e.response.status_code == 404
                     and config.resol_device_type == 'auto'):
-                logging.warning(f"HTTP 404 with auto-detected device type '{detected_device_type}'"
-                                " - re-running device detection")
+                logging.info("HTTP 404 with auto-detected device type '{}'"
+                             " - re-running device detection".format(detected_device_type))
                 if detect_resol_device():
-                    logging.info(f"Device re-detected as: {detected_device_type}")
+                    logging.info("Device re-detected as: {}".format(detected_device_type))
                     retry_count = 0
                     continue
 
@@ -355,7 +355,6 @@ def polling_loop(stop):
                 time.sleep(retry_delay)
 
         except Exception as e:
-            logging.error(f"Unexpected error in polling loop: {e}")
             logging.error(traceback.format_exc())
             time.sleep(retry_delay)
 
